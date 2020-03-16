@@ -9,7 +9,7 @@ type command =
 let escape_commas (s: string) =
   let b = Buffer.create 20 in
   String.iter (function
-    | '\\' -> Buffer.add_string b "\\\\" 
+    | '\\' -> Buffer.add_string b "\\\\"
     | ',' -> Buffer.add_string b "\\,"
     | c -> Buffer.add_char b c
   ) s;
@@ -39,19 +39,13 @@ module P = struct
   open Angstrom
 
   let any_string =
-    BE.any_int32 >>= fun len -> take (Int32.to_int len)
-
-  let string (s: string) =
-    BE.int32 (Int32.of_int (String.length s)) *>
-    Angstrom.string s *>
-    return ()
-
-  let reply_header =
-    BE.any_int32 <* int8 0
+    BE.any_int32 >>= fun len ->
+    assert (len <> -1l);
+    take (Int32.to_int len)
 
   (* Objects *)
 
-  (* an object of type ['a obj_ty] represents a value of type ['a] after parsing *)
+  (* an object of type ['a obj_ty] can be parsed into a value of type ['a] *)
   type _ obj_ty =
     | Char : char obj_ty
     | Int : int32 obj_ty
@@ -60,11 +54,23 @@ module P = struct
     | Buffer : string option obj_ty
     | Pointer : string option obj_ty
     | Time : string obj_ty
-    | Hashtable : ('a obj_ty * 'b obj_ty * ('a * 'b) list) obj_ty
-    | Hdata : (string * 'ks hdata_keys * (string option * 'ks) list) obj_ty
+    | Hashtable : hashtable_ty obj_ty
+    | Hdata : hdata_ty obj_ty
     | Info : (string * string) obj_ty
-    | Infolist : (string * 'a infolist_items) obj_ty
-    | Array : ('a obj_ty * 'a list) obj_ty
+    | Infolist : infolist_ty obj_ty
+    | Array : array_ty obj_ty
+
+  and hashtable_ty =
+    | HashtableTy : 'a obj_ty * 'b obj_ty * ('a * 'b) list -> hashtable_ty
+
+  and hdata_ty =
+    | HdataTy : string * 'ks hdata_keys * (string option * 'ks) list -> hdata_ty
+
+  and infolist_ty =
+    | InfolistTy : string * 'a infolist_items -> infolist_ty
+
+  and array_ty =
+    | ArrayTy : 'a obj_ty * 'a list -> array_ty
 
   and _ hdata_keys =
     | Hdata_keys_nil : unit hdata_keys
@@ -92,7 +98,19 @@ module P = struct
   let array_ty = Angstrom.string "arr" >>| fun _ -> Array
 
   type any_obj_ty =
-    | AnyObjTy : 'a obj_ty -> any_obj_ty
+    | AnyObjTy : 'a obj_ty -> any_obj_ty [@@ocaml.unboxed]
+
+  type any_hdata_keys =
+    | AnyHdataKeys : 'a hdata_keys -> any_hdata_keys [@@ocaml.unboxed]
+
+  type any_infolist_item =
+    | AnyInfolistItem : 'a infolist_item -> any_infolist_item [@@ocaml.unboxed]
+
+  type any_infolist_items =
+    | AnyInfolistItems : 'a infolist_items -> any_infolist_items [@@ocaml.unboxed]
+
+  type any_obj =
+    | AnyObj : 'a obj_ty * 'a -> any_obj
 
   let pack_obj_ty x = AnyObjTy x
 
@@ -112,10 +130,32 @@ module P = struct
       array_ty >>| pack_obj_ty;
     ]
 
-  let obj_str_contents =
+  let any_string_or_null =
     BE.any_int32 >>= fun len ->
     if len = -1l then return None
     else any_string >>| fun s -> Some s
+
+  let pointer =
+    any_int8 >>= fun len ->
+    take len >>| fun s ->
+    if len = 1 && s.[0] = '0' then None
+    else Some s
+
+  (* FIXME: this accepts more than what the format specifies (eg "foo:bar,") *)
+  let hdata_keys : any_hdata_keys t = fix (fun hdata_keys_rec ->
+    (lift3 (fun x y z -> x,y,z)
+       (take_while ((<>) ':') <* char ':')
+       (obj_ty <* char ',')
+       hdata_keys_rec >>| fun (key, AnyObjTy ty, AnyHdataKeys keys) ->
+     AnyHdataKeys (Hdata_keys_cons (key, ty, keys)))
+    <|>
+    (lift2 (fun x y -> x,y)
+       (take_while ((<>) ':') <* char ':')
+       obj_ty >>| fun (key, AnyObjTy ty) ->
+     AnyHdataKeys (Hdata_keys_cons (key, ty, Hdata_keys_nil)))
+    <|>
+    (return (AnyHdataKeys Hdata_keys_nil))
+  )
 
   let rec obj_data : type a. a obj_ty -> a t = fun (ty: a obj_ty) ->
     match ty with
@@ -123,68 +163,72 @@ module P = struct
     | Int -> BE.any_int32
     | Long ->
       any_int8 >>= fun len -> take len
-    | String -> obj_str_contents
-    | Buffer -> obj_str_contents
-    | Pointer ->
-      any_int8 >>= fun len ->
-      take len >>| fun s ->
-      if len = 1 && s.[0] = '0' then None
-      else Some s
+    | String -> any_string_or_null
+    | Buffer -> any_string_or_null
+    | Pointer -> pointer
     | Time -> any_string
-    (* | Hashtable ->
-     *   lift3 (fun x y z -> x,y,z) obj_ty obj_ty BE.any_int32 >>= fun (key_ty_packed, val_ty_packed, size) ->
-     *   let AnyObjTy key_ty = key_ty_packed in
-     *   let AnyObjTy val_ty = val_ty_packed in
-     *   let data_parser =
-     *     count (Int32.to_int size) (lift2 (fun k v -> k, v) (obj_data key_ty) (obj_data val_ty)) in
-     *   data_parser >>| fun data -> key_ty, val_ty, data *)
+    | Hashtable ->
+      lift3 (fun x y z -> x,y,z)
+        obj_ty obj_ty BE.any_int32 >>= fun (key_ty_packed, val_ty_packed, size) ->
+      let AnyObjTy key_ty = key_ty_packed in
+      let AnyObjTy val_ty = val_ty_packed in
+      let data_parser =
+        count (Int32.to_int size) (lift2 (fun k v -> k, v) (obj_data key_ty) (obj_data val_ty)) in
+      data_parser >>| fun data -> HashtableTy (key_ty, val_ty, data)
     | Array ->
-      let _ = ty in
       lift2 (fun x y -> x,y) obj_ty BE.any_int32 >>= fun (ty_packed, size) ->
       let AnyObjTy ty = ty_packed in
       let size = Int32.to_int size in
       count size (obj_data ty) >>| fun data ->
-      ty, data
-    | _ -> assert false
-    
-(*    match ty with
-    | `Char -> any_char >>| fun c -> `Char c
-    | `Int -> BE.any_int32 >>| fun i -> `Int i
-    | `Long ->
-      any_int8 >>= fun len ->
-      take len >>| fun s -> `Long s
-    | `String -> obj_str_contents >>| fun s -> `String s
-    | `Buffer -> obj_str_contents >>| fun s -> `Buffer s
-    | `Pointer ->
-      any_int8 >>= fun len ->
-      take len >>| fun s ->
-      if len = 1 && s.[0] = '0' then
-        `Pointer None
-      else
-        `Pointer (Some s)
-    | `Time -> any_string >>| fun s -> `Time s
-    | `Hashtable ->
-      lift3 (fun x y z -> x,y,z) obj_ty obj_ty BE.any_int32 >>= fun (key_ty, val_ty, size) ->
-      count (Int32.to_int size) (lift2 (fun k v -> k, v) (obj_data key_ty) (obj_data val_ty))
-      >>| fun h -> `Hashtable h
-    | _ ->
-      failwith "todo"
-*)
+      ArrayTy (ty, data)
+    | Hdata ->
+      lift3 (fun x y z -> x,y,z)
+        any_string hdata_keys BE.any_int32 >>= fun (hpath, AnyHdataKeys keys, nbitems) ->
+      count (Int32.to_int nbitems)
+        (lift2 (fun ptr item -> ptr, item) pointer (hdata_item keys)) >>| fun items ->
+      HdataTy (hpath, keys, items)
+    | Info ->
+      lift2 (fun x y -> x,y) any_string any_string
+    | Infolist ->
+      lift2 (fun x y -> x,y) any_string BE.any_int32 >>= fun (name, nbitems) ->
+      infolist_items_rec (Int32.to_int nbitems) >>| fun (AnyInfolistItems items) ->
+      InfolistTy (name, items)
 
-  let info =
-    info_ty *>
-    lift2 (fun a b -> `Info (a, b)) any_string any_string
+  and hdata_item : type ks. ks hdata_keys -> ks t = fun keys ->
+    match keys with
+    | Hdata_keys_nil -> return ()
+    | Hdata_keys_cons (_, ty, keys') ->
+      lift2 (fun item items -> item, items)
+        (obj_data ty) (hdata_item keys')
 
-  let obj' =
-    let open Angstrom in
-    choice [
-      info;
-      take_while (fun _ -> true) >>| fun s -> `Other s;
-    ]
+  and infolist_items_rec : int -> any_infolist_items t = fun n ->
+    if n = 0 then return (AnyInfolistItems Infolist_items_nil)
+    else
+      BE.any_int32 >>= fun nbvalues ->
+      infolist_item_rec (Int32.to_int nbvalues) >>= fun (AnyInfolistItem item) ->
+      infolist_items_rec (n-1) >>| fun (AnyInfolistItems items) ->
+      AnyInfolistItems (Infolist_items_cons (item, items))
 
-  let reply =
-    lift2 (fun id content -> (id, content))
-      any_string (many obj')
+  and infolist_item_rec : int -> any_infolist_item t = fun n ->
+    if n = 0 then return (AnyInfolistItem Infolist_item_nil)
+    else
+      any_string >>= fun name ->
+      obj_ty >>= fun (AnyObjTy ty) ->
+      obj_data ty >>= fun v ->
+      infolist_item_rec (n-1) >>| fun (AnyInfolistItem values) ->
+      AnyInfolistItem (Infolist_item_cons (name, ty, v, values))
+
+  let obj : any_obj t =
+    obj_ty >>= fun (AnyObjTy ty) ->
+    obj_data ty >>| fun data ->
+    AnyObj (ty, data)
+
+  let reply_header =
+    BE.any_int32 <* int8 0
+
+  let reply_data : (string * any_obj list) t =
+    lift2 (fun id objects -> id, objects)
+      any_string (many obj)
 end
 
 let really_input_s cin len =
